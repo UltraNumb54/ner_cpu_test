@@ -1,4 +1,12 @@
+print("   Токены в проблемной области:")
+                for token in doc:
+                    if token.idx >= start - 20 and token.idx <= end + 20:
+                        print(f"      '{token.text}' (idx: {token.idx}, len: {len(token.text)})")
+            else:
+                print(f"✅ Span создан успешно: '{span.text}' -> {span.label_}")
+                entities.append((start, end, label))
 
+        examples.append((reconstructed_text, {"entities": entities}))
 
 
 def prepare_training_data(spacy_nlp, train_tuples):
