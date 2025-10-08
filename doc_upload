@@ -1,3 +1,97 @@
+def normalize_whitespace(text):
+    """Заменяет любую последовательность пробельных символов (включая \n, \t) на один пробел."""
+    return re.sub(r'\s+', ' ', text)
+
+def load_data_from_json(json_path, text_base_dir):
+    """
+    Загружает данные из JSON-файла Label Studio и сопоставляет с текстовыми файлами,
+    нормализуя пробельные символы для сопоставления координат сущностей.
+    """
+    with open(json_path, 'r', encoding='utf-8') as f:
+        raw_data = json.load(f)
+
+    examples = []
+    for item in raw_data:
+        # Извлекаем номер файла из пути в JSON
+        json_file_path = item["text"]
+        file_num_match = re.search(r'output_(\d+)\.txt$', json_file_path)
+        if not file_num_match:
+             print(f"Не удалось извлечь номер файла из пути: {json_file_path}")
+             continue # Пропускаем, если не найден
+
+        file_num = file_num_match.group(1)
+        # Составляем путь к реальному файлу
+        real_file_path = os.path.join(text_base_dir, f"output_{file_num}.txt")
+
+        if not os.path.exists(real_file_path):
+            print(f"Файл не найден: {real_file_path}")
+            continue # Пропускаем, если файл не существует
+
+        # Читаем текст из файла
+        with open(real_file_path, 'r', encoding='utf-8') as txt_file:
+            text = txt_file.read()
+
+        # Подготовка аннотаций
+        entities = []
+        for label_info in item["label"]:
+            original_start = int(label_info["start"])
+            original_end = int(label_info["end"])
+            label = label_info["labels"][0]
+
+            # Извлекаем текст, который Label Studio считала сущностью (по оригинальным координатам)
+            try:
+                original_span = text[original_start:original_end]
+            except IndexError:
+                print(f"ПРЕДУПРЕЖДЕНИЕ: Оригинальные индексы [{original_start}:{original_end}] выходят за границы текста файла {real_file_path}. Пропускаем сущность.")
+                continue
+
+            # Нормализуем пробелы в сущности из JSON
+            normalized_original_span = normalize_whitespace(original_span)
+
+            # Нормализуем весь текст файла
+            normalized_text = normalize_whitespace(text)
+
+            # Ищем нормализованную сущность в нормализованном тексте
+            normalized_pos = normalized_text.find(normalized_original_span)
+
+            if normalized_pos != -1:
+                escaped_span = re.escape(original_span)
+                # Заменяем любую последовательность пробельных символов на \s+
+                regex_pattern = re.sub(r'\s+', r'\\s+', escaped_span)
+
+                match = re.search(regex_pattern, text)
+                if match:
+                    corrected_start = match.start()
+                    corrected_end = match.end()
+                    matched_text = text[corrected_start:corrected_end]
+                    print(f"Сущность (с гибким поиском) '{original_span}' (метка: {label}) найдена в файле {real_file_path} по координатам [{corrected_start}:{corrected_end}]. Найденный текст: '{matched_text}'")
+                else:
+                    print(f"ПРЕДУПРЕЖДЕНИЕ: Сущность '{original_span}' (метка: {label}) не найдена в файле {real_file_path} даже с гибким поиском по пробельным символам. Пропускаем сущность.")
+                    continue
+            else:
+                # Даже нормализованный поиск не помог
+                 print(f"ПРЕДУПРЕЖДЕНИЕ: Нормализованная сущность '{normalized_original_span}' не найдена в нормализованном тексте файла {real_file_path}. Пропускаем сущность.")
+                 continue
+
+            # --- /Попытка сопоставления ---
+
+            # Проверим, не выходит ли сдвиг за границы текста (на всякий случай)
+            if corrected_start < 0 or corrected_end > len(text) or corrected_start > corrected_end:
+                print(f"ПРЕДУПРЕЖДЕНИЕ: Сопоставленные индексы [{corrected_start}:{corrected_end}] некорректны для файла {real_file_path}. Пропускаем сущность.")
+                continue
+
+            # Проверка: выводим текст по сопоставленным позициям
+            final_matched_text = text[corrected_start:corrected_end]
+            print(f"ИТОГО: для метки '{label}' в файле {real_file_path}, текст: '{final_matched_text}', координаты: [{corrected_start}:{corrected_end}]")
+            print("---")
+
+            entities.append((corrected_start, corrected_end, label))
+
+        examples.append((text, {"entities": entities}))
+
+    return examples
+///////////////////////
+
 import sys
 import spacy
 from spacy.training import Example
