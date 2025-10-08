@@ -1,4 +1,3 @@
-# Убедитесь, что spaCy и ru_core_news_sm установлены
 import sys
 import spacy
 from spacy.training import Example
@@ -6,6 +5,7 @@ import random
 import json
 import os
 from pathlib import Path
+import re
 
 # Загрузка предобученной модели
 nlp = spacy.load("ru_core_news_sm")
@@ -25,10 +25,10 @@ def load_data_from_json(json_path, text_base_dir):
         file_num_match = re.search(r'output_(\d+)\.txt$', json_file_path)
         if not file_num_match:
              print(f"Не удалось извлечь номер файла из пути: {json_file_path}")
-             continue # Пропускаем, если не найден
+             continue
 
         file_num = file_num_match.group(1)
-        # Составляем путь к реальному файлу
+ 
         real_file_path = os.path.join(text_base_dir, f"output_{file_num}.txt")
 
         if not os.path.exists(real_file_path):
@@ -42,14 +42,16 @@ def load_data_from_json(json_path, text_base_dir):
         # Подготовка аннотаций
         entities = []
         for label_info in item["label"]:
-            start = label_info["start"]
-            end = label_info["end"]
-            label = label_info["labels"][0] # Предполагаем, что всегда одна метка
+         
+            start = int(label_info["start"])
+            end = int(label_info["end"])
+            label = label_info["labels"][0]
 
-            # Проверка сдвига: выводим текст по указанным позициям
-            # print(f"JSON Path: {json_file_path}, Start: {start}, End: {end}, Label: {label}")
-            # print(f"Text at position [{start}:{end}]: '{text[start:end]}'")
-            # print("---")
+     
+            print(f"JSON Path: {json_file_path}, Real Path: {real_file_path}")
+            print(f"Start: {start}, End: {end}, Label: {label}")
+            print(f"Text at position [{start}:{end}]: '{text[start:end]}'")
+            print("---")
 
             entities.append((start, end, label))
 
@@ -57,14 +59,22 @@ def load_data_from_json(json_path, text_base_dir):
 
     return examples
 
-# --- ВАЖНО: Укажите пути к вашему датасету и папке с текстовыми файлами ---
-import re # Импортируем регулярные выражения для поиска номера файла
-json_dataset_path = "path/to/your/dataset.json" # ЗАМЕНИТЕ НА ПУТЬ К ВАШЕМУ JSON-ФАЙЛУ
-text_files_directory = "path/to/your/text_files" # ЗАМЕНИТЕ НА ПУТЬ К ДИРЕКТОРИИ С TXT-ФАЙЛАМИ
+
+json_dataset_path = "/path/to/your/actual/dataset.json"
+text_files_directory = "/path/to/your/actual/text_files"
+
+print(f"Попытка загрузки данных из: {json_dataset_path}")
+print(f"Папка с текстовыми файлами: {text_files_directory}")
 
 # Загрузка данных
 TRAIN_DATA = load_data_from_json(json_dataset_path, text_files_directory)
 print(f"Загружено {len(TRAIN_DATA)} примеров для обучения.")
+
+print(f"Тип TRAIN_DATA: {type(TRAIN_DATA)}")
+if TRAIN_DATA:
+    first_item = TRAIN_DATA[0]
+    print(f"Тип первого элемента TRAIN_DATA: {type(first_item)}")
+    print(f"Пример содержимого первого элемента (текст[:100]): {first_item[0][:100]}...")
 
 def train_spacy_model(train_data, n_iter=30):
     """
