@@ -1,0 +1,188 @@
+# --- Ячейка 1: Импорт библиотек ---
+import spacy
+from spacy.training import Example
+import random
+import json
+import os
+import re
+from pathlib import Path
+
+# --- Ячейка 2: Загрузка и предварительная обработка данных из Label Studio JSON ---
+def load_label_studio_data(json_path, text_base_path):
+    """
+    Загружает данные из JSON-файла Label Studio и сопоставляет их с текстами из файлов.
+    json_path: путь к JSON-файлу экспорта Label Studio.
+    text_base_path: базовый путь к директории, где находятся исходные текстовые файлы.
+    Возвращает список кортежей (text, annotations), готовых для spaCy.
+    """
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    processed_data = []
+    for item in data:
+        # Извлекаем имя файла из поля 'text' в JSON Label Studio
+        ls_file_path = item['text']
+        # Извлекаем только имя файла (например, a1ec1f18-text_1.txt)
+        file_name = Path(ls_file_path).name
+        # Формируем полный путь к текстовому файлу
+        full_text_path = os.path.join(text_base_path, file_name)
+
+        if not os.path.exists(full_text_path):
+            print(f"Предупреждение: Файл {full_text_path} не найден. Пропускаю.")
+            continue
+
+        with open(full_text_path, 'r', encoding='utf-8') as txt_file:
+            text = txt_file.read()
+
+        # Подготовка аннотаций в формате spaCy
+        entities = []
+        for label in item['label']:
+            start = label['start']
+            end = label['end']
+            label_type = label['labels'][0] # Предполагаем, что всегда есть хотя бы одна метка
+
+            # Проверка на корректность индексов
+            if start < 0 or end > len(text) or start >= end:
+                print(f"Предупреждение: Некорректные индексы ({start}, {end}) для текста ID {item['id']}. Пропускаю сущность.")
+                continue
+
+            # Извлечение текста сущности для проверки
+            entity_text = text[start:end]
+            entities.append((start, end, label_type))
+
+        processed_data.append((text, {"entities": entities}))
+
+    return processed_data
+
+# --- Ячейка 3: Загрузка ваших данных ---
+# Укажите пути к вашему JSON-файлу и директории с исходными текстами
+label_studio_json_path = "path/to/your/label_studio_export.json" # ЗАМЕНИТЕ НА ВАШ ПУТЬ
+text_files_directory = "path/to/your/text/files" # ЗАМЕНИТЕ НА ВАШ ПУТЬ
+
+# Загружаем и обрабатываем данные
+raw_data = load_label_studio_data(label_studio_json_path, text_files_directory)
+
+# Проверка корректности загрузки и смещений
+print("--- Проверка смещений ---")
+for text, annotations in raw_data[:2]: # Проверяем первые 2 примера
+    print(f"Текст: {text[:100]}...") # Выводим начало текста
+    for ent_start, ent_end, ent_label in annotations["entities"]:
+        extracted_text = text[ent_start:ent_end]
+        print(f"  Метка: {ent_label}, Смещения: ({ent_start}, {ent_end}), Извлеченный текст: '{extracted_text}'")
+    print("-" * 20)
+
+# --- Ячейка 4: Подготовка данных для обучения spaCy ---
+def create_training_data_spacy(processed_data):
+    """
+    Преобразует данные из формата Label Studio в формат spaCy.
+    """
+    examples = []
+    nlp = spacy.blank("ru") # Используем пустую русскую модель
+    for text, annotations in processed_data:
+        doc = nlp.make_doc(text)
+        ents = []
+        for start, end, label in annotations["entities"]:
+            # Создаем объект Span для сущности
+            span = doc.char_span(start, end, label=label)
+            if span is not None:
+                ents.append(span)
+            else:
+                # Обработка случаев, когда span не может быть создан (например, на границе токенов)
+                print(f"Предупреждение: Не удалось создать span для ({start}, {end}, {label}) в тексте '{text[start:end]}'")
+        doc.ents = ents
+        example = Example.from_dict(doc, annotations)
+        examples.append(example)
+    return examples
+
+# Подготовка обучающих примеров
+train_examples = create_training_data_spacy(raw_data)
+
+# --- Ячейка 5: Инициализация и настройка модели spaCy ---
+# Загружаем предварительно обученную модель или создаем пустую
+# nlp = spacy.load("ru_core_news_sm") # Загрузка предобученной модели (альтернатива)
+nlp = spacy.blank("ru") # Создание пустой модели
+
+# Добавляем компонент NER к конвейеру
+if "ner" not in nlp.pipe_names:
+    ner = nlp.add_pipe("ner")
+else:
+    ner = nlp.get_pipe("ner")
+
+# Добавляем ваши метки в компонент NER
+for _, annotations in raw_data:
+    for ent in annotations.get("entities"):
+        ner.add_label(ent[2]) # ent[2] - это label_type
+
+# --- Ячейка 6: Обучение модели ---
+# Используем стандартный обучатель
+optimizer = nlp.begin_training()
+
+# Параметры обучения
+n_iter = 30 # Количество эпох
+dropout = 0.5 # Вероятность дропаута
+
+print("Начинаю обучение...")
+for i in range(n_iter):
+    print(f"Эпоха {i+1}/{n_iter}")
+    random.shuffle(train_examples) # Перемешиваем данные каждый раз
+    losses = {}
+    batches = spacy.util.minibatch(train_examples, size=2) # Размер батча можно настроить
+    for batch in batches:
+        nlp.update(batch, drop=dropout, losses=losses)
+    print(f"  Потери: {losses}")
+
+print("Обучение завершено.")
+
+# --- Ячейка 7: Сохранение обученной модели ---
+model_output_dir = "custom_ner_model" # Укажите путь для сохранения
+nlp.to_disk(model_output_dir)
+print(f"Модель сохранена в {model_output_dir}")
+
+# --- Ячейка 8: Загрузка и тестирование модели на новом тексте ---
+# Загрузка обученной модели
+nlp_loaded = spacy.load(model_output_dir)
+
+# Функция для обработки нового текста и сохранения результатов
+def process_new_text_and_save(nlp_model, input_txt_path, output_json_path, output_id):
+    """
+    Обрабатывает текст из input_txt_path, находит сущности с помощью nlp_model,
+    и сохраняет результаты в формате, похожем на Label Studio, в output_json_path.
+    output_id: идентификатор для записи в JSON-результат.
+    """
+    with open(input_txt_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    doc = nlp_model(text)
+
+    # Подготовка результатов в формате, похожем на Label Studio
+    ls_format_result = {
+        "text": f"/data/upload/1/{Path(input_txt_path).name}", # Используем имя входного файла
+        "id": output_id,
+        "label": []
+    }
+
+    for ent in doc.ents:
+        ls_format_result["label"].append({
+            "start": ent.start_char,
+            "end": ent.end_char,
+            "labels": [ent.label_]
+        })
+
+    # Сохраняем результат в JSON
+    with open(output_json_path, 'w', encoding='utf-8') as f:
+        json.dump([ls_format_result], f, ensure_ascii=False, indent=2)
+
+    print(f"Результаты для {input_txt_path} сохранены в {output_json_path}")
+    print("--- Найденные сущности ---")
+    for ent in doc.ents:
+        print(f"Текст: '{ent.text}' | Метка: {ent.label_} | Смещения: ({ent.start_char}, {ent.end_char})")
+    print("-" * 20)
+
+# --- Ячейка 9: Тестирование на новом файле ---
+# Укажите путь к новому текстовому файлу для тестирования
+new_text_file_path = "path/to/your/new_input_text.txt" # ЗАМЕНИТЕ НА ВАШ ПУТЬ
+output_file_number = 1 # Укажите номер для выходного файла, например, 1 -> output_1.json
+output_json_file_path = f"output_{output_file_number}.json"
+
+# Вызов функции для обработки и сохранения
+process_new_text_and_save(nlp_loaded, new_text_file_path, output_json_file_path, output_file_number)
