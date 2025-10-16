@@ -13,7 +13,7 @@ print("--- Тестирование baseline модели TF-IDF + LogisticRegre
 print("Цель: Классификация русскоязычных текстов техподдержки по сервисам.")
 print("Метод: TF-IDF векторизация + Логистическая регрессия с подбором гиперпараметров.")
 print("Обработка дисбаланса: Использование class_weight='balanced'.")
-print("Ожидаемое количество записей в датасете: ~70,000.")
+print("Ограничение размера датасета: до 10,000 записей для ускорения.")
 print("-------------------------------------------------------------------")
 
 # --- Загрузка данных ---
@@ -22,6 +22,17 @@ df = pd.read_csv(CSV_PATH, encoding='utf-8')
 
 print(f"Датасет загружен. Количество записей: {len(df)}")
 print(f"Количество уникальных классов (service): {df['service'].nunique()}")
+
+# --- Ограничение размера датасета ---
+MAX_ROWS = 10000
+if len(df) > MAX_ROWS:
+    print(f"Датасет превышает {MAX_ROWS} записей. Выполняется сэмплирование...")
+    # Сэмплируем с восстановлением, чтобы сохранить распределение классов (stratify не работает с sample)
+    # Просто случайный выбор
+    df = df.sample(n=MAX_ROWS, random_state=42).reset_index(drop=True)
+    print(f"Датасет ограничен до {len(df)} случайных записей.")
+
+print(f"Размер датасета после ограничения: {len(df)}")
 
 # --- Разделение признаков и целевой переменной ---
 X = df['combined_text']
@@ -36,7 +47,7 @@ print(f"Размер обучающей выборки: {len(X_train)}")
 print(f"Размер тестовой выборки: {len(X_test)}")
 
 # --- Векторизация TF-IDF ---
-print("\n--- Векторизация TF-IDF ---")
+print("\n--- Этап 1: Векторизация TF-IDF ---")
 tfidf = TfidfVectorizer(
     max_features=10000,  # Макс. количество уникальных слов
     ngram_range=(1, 2),  # Униграммы и биграммы
@@ -44,22 +55,24 @@ tfidf = TfidfVectorizer(
 )
 print(f"Параметры векторайзера: max_features={tfidf.max_features}, ngram_range={tfidf.ngram_range}")
 
+print("Обучение векторайзера и преобразование обучающих данных...")
 X_train_tfidf = tfidf.fit_transform(X_train)
+print("Преобразование тестовых данных...")
 X_test_tfidf = tfidf.transform(X_test)
 
 print(f"Размерность TF-IDF матрицы (обучающая): {X_train_tfidf.shape}")
 print(f"Размерность TF-IDF матрицы (тестовая): {X_test_tfidf.shape}")
 
 # --- Подбор гиперпараметров и обучение модели ---
-print("\n--- Подбор гиперпараметров ---")
+print("\n--- Этап 2: Подбор гиперпараметров (GridSearchCV) ---")
 param_grid = {
     'C': [0.1, 1, 10],           # Регуляризация
     'penalty': ['l1', 'l2'],     # Тип регуляризации
     'solver': ['saga']           # Решатель, поддерживающий l1 и l2 для мультикласса
 }
 print(f"Сетка параметров: {param_grid}")
+print(f"Количество комбинаций параметров: {len(param_grid['C']) * len(param_grid['penalty']) * len(param_grid['solver'])}")
 
-# Увеличиваем max_iter для избежания ConvergenceWarning
 base_model = LogisticRegression(random_state=42, class_weight='balanced', max_iter=5000)
 
 grid_search = GridSearchCV(
@@ -68,20 +81,23 @@ grid_search = GridSearchCV(
     cv=3,                        # 3-фолдная кросс-валидация
     scoring='f1_macro',          # Метрика оценки (f1_macro учитывает дисбаланс)
     n_jobs=-1,                   # Использовать все ядра
-    verbose=1                    # Печатать прогресс
+    verbose=2                    # Печатать прогресс для каждой подгонки (более подробно)
 )
 
-print("Начинается подбор гиперпараметров с кросс-валидацией...")
-grid_search.fit(X_train_tfidf, y_train)
+print("Запуск GridSearchCV. Это может занять некоторое время...")
+print("Формат вывода verbose=2 (показывает каждую подгонку):")
+grid_search.fit(X_train_tfidf, y_train) # <-- Точка входа в основной этап обучения/поиска
 
+print("\n--- Результаты подбора гиперпараметров ---")
 print("Лучшие параметры:", grid_search.best_params_)
 print("Лучшая оценка (f1_macro на CV):", grid_search.best_score_)
 
 best_model = grid_search.best_estimator_
-print(f"Обученная модель: {best_model}")
+print(f"Обученная лучшая модель: {best_model}")
 
 # --- Предсказание на тестовой выборке ---
-print("\n--- Предсказание и оценка ---")
+print("\n--- Этап 3: Предсказание и оценка на тестовой выборке ---")
+print("Выполнение предсказаний на тестовой выборке...")
 y_pred = best_model.predict(X_test_tfidf)
 
 # --- Оценка модели ---
@@ -93,6 +109,7 @@ print("\nОтчет классификации (Test Set):")
 print(classification_report(y_test, y_pred))
 
 # --- Визуализация: Матрица ошибок ---
+print("\n--- Визуализация: Матрица ошибок ---")
 cm = confusion_matrix(y_test, y_pred)
 plt.figure(figsize=(12, 10))
 num_classes_to_show = min(10, len(best_model.classes_))
@@ -128,9 +145,9 @@ else:
     plt.show()
 
 # --- Анализ важных признаков (топ-слова для классов) ---
+print("\n--- Анализ: Топ-5 важных слов для каждого класса ---")
 feature_names = np.array(tfidf.get_feature_names_out())
 
-print("\n--- Топ-5 важных слов для каждого класса ---")
 if best_model.coef_.shape[0] == 1: # Бинарная классификация (редко для service)
     top_indices = np.argsort(best_model.coef_[0])[::-1]
     top_features = feature_names[top_indices][:5]
@@ -145,9 +162,10 @@ else: # Мультикласс
 print("\n--- Обучение и анализ TF-IDF + LogisticRegression завершены ---")
 
 # --- Сохранение модели и векторайзера ---
-MODEL_PATH = "logreg_tfidf_model.pkl"
-TFIDF_PATH = "tfidf_vectorizer.pkl"
+MODEL_PATH = "logreg_tfidf_model_10k.pkl"
+TFIDF_PATH = "tfidf_vectorizer_10k.pkl"
 
+print(f"Сохранение модели и векторайзера...")
 joblib.dump(best_model, MODEL_PATH)
 joblib.dump(tfidf, TFIDF_PATH)
 print(f"\nЛучшая модель сохранена в: {MODEL_PATH}")
