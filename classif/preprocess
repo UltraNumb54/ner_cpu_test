@@ -53,10 +53,15 @@ def load_and_preprocess_xml(xml_file_path, min_class_samples=5):
 def preprocess_text(text):
     if not text:
         return ""
+    # Удаляем всё, кроме кириллических букв и пробелов
+    text = re.sub(r'[^а-яёА-ЯЁ\s]', ' ', text)
+    # Нормализуем пробелы
     text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'[^а-яёА-ЯЁa-zA-Z0-9\s]', ' ', text)
+    # Пробуем разделить "слитные" слова (только для кириллицы)
+    text = re.sub(r'(?<=[а-яё])(?=[А-ЯЁ])|(?<=[А-ЯЁ])(?=[А-ЯЁ][а-яё])', ' ', text)
+    # Нормализуем пробелы после вставки
     text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'(?<=[а-яёa-z0-9])(?=[А-ЯЁA-Z])|(?<=[А-ЯЁA-Z])(?=[А-ЯЁA-Z][а-яёa-z])', ' ', text)
+    # Убираем лишние пробелы в начале и конце
     text = text.strip()
     return text
 
@@ -64,43 +69,55 @@ if __name__ == "__main__":
     XML_PATH = "path/to/your/dataset.xml"
     MIN_SAMPLES = 10
 
-    print("Loading and preprocessing data...")
+    print("Загрузка и предобработка данных...")
     processed_data = load_and_preprocess_xml(XML_PATH, min_class_samples=MIN_SAMPLES)
 
-    print(f"Loaded {len(processed_data)} records after filtering and preprocessing.")
-    if processed_data:
-        print("Sample processed record:")
+    print(f"Загружено {len(processed_data)} записей после фильтрации и предобработки.")
+    if processed_
+        print("Пример предобработанной записи:")
         print(processed_data[0])
 
-        print("\n--- Dataset Statistics ---")
+        print("\n--- Статистика по датасету ---")
         num_classes = len(set(r['service'] for r in processed_data))
-        print(f"Number of unique classes (after filtering): {num_classes}")
+        print(f"Количество уникальных классов (после фильтрации): {num_classes}")
 
         service_counts_after_filter = Counter([r['service'] for r in processed_data])
         counts = list(service_counts_after_filter.values())
 
-        print(f"Min samples per class: {min(counts)}")
-        print(f"Max samples per class: {max(counts)}")
-        print(f"Mean samples per class: {np.mean(counts):.2f}")
-        print(f"Median samples per class: {np.median(counts):.2f}")
+        print(f"Минимальное количество образцов в классе: {min(counts)}")
+        print(f"Максимальное количество образцов в классе: {max(counts)}")
+        print(f"Среднее количество образцов в классе: {np.mean(counts):.2f}")
+        print(f"Медианное количество образцов в классе: {np.median(counts):.2f}")
 
         text_lengths = [len(r['combined_text']) for r in processed_data]
-        print(f"Min text length: {min(text_lengths)}")
-        print(f"Max text length: {max(text_lengths)}")
-        print(f"Mean text length: {np.mean(text_lengths):.2f}")
+        print(f"Минимальная длина текста: {min(text_lengths)}")
+        print(f"Максимальная длина текста: {max(text_lengths)}")
+        print(f"Средняя длина текста: {np.mean(text_lengths):.2f}")
 
-        plt.figure(figsize=(12, 6))
-        plt.bar(range(len(service_counts_after_filter)), list(service_counts_after_filter.values()))
-        plt.title('Distribution of samples per class (after filtering)')
-        plt.xlabel('Class (service)')
-        plt.ylabel('Number of samples')
-        plt.xticks(rotation=90)
+        # --- Визуализация ---
+        fig, ax = plt.subplots(figsize=(14, 8))
+        services = list(service_counts_after_filter.keys())
+        counts_list = list(service_counts_after_filter.values())
+        ax.bar(range(len(services)), counts_list)
+        ax.set_title('Распределение количества образцов по классам (после фильтрации)')
+        ax.set_xlabel('Класс (service)')
+        ax.set_ylabel('Количество образцов')
+        ax.set_xticks(range(len(services)))
+        ax.set_xticklabels(services, rotation=90, ha="right") # Подписи под столбцами
         plt.tight_layout()
         plt.show()
 
-        plt.figure(figsize=(10, 6))
-        plt.hist(text_lengths, bins=50, edgecolor='black')
-        plt.title('Distribution of text lengths (combined_text)')
-        plt.xlabel('Text length (characters)')
-        plt.ylabel('Number of samples')
-        plt.show()
+        # --- Гистограмма длин текстов ---
+        # Проверим, есть ли разнообразие в длинах
+        unique_lengths = set(text_lengths)
+        if len(unique_lengths) == 1:
+             print(f"Все тексты имеют одинаковую длину: {text_lengths[0]} символов. Гистограмма неинформативна.")
+        else:
+            # Определим количество бинов разумно
+            num_bins = min(50, len(unique_lengths))
+            plt.figure(figsize=(10, 6))
+            plt.hist(text_lengths, bins=num_bins, edgecolor='black')
+            plt.title('Распределение длин текстов (combined_text)')
+            plt.xlabel('Длина текста (символы)')
+            plt.ylabel('Количество образцов')
+            plt.show()
