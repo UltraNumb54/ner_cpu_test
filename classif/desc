@@ -1,0 +1,2 @@
+TF-IDF + LogisticRegression как baseline
+LightGBM с TF-IDF признаками
