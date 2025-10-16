@@ -1,0 +1,131 @@
+import xml.etree.ElementTree as ET
+import re
+from collections import Counter
+import unicodedata
+
+def load_and_preprocess_xml(xml_file_path, min_class_samples=5):
+    """
+    Загружает XML-файл датасета, фильтрует по количеству образцов в классе,
+    объединяет topic и description, и предобрабатывает текст.
+
+    Args:
+        xml_file_path (str): Путь к XML-файлу датасета.
+        min_class_samples (int): Минимальное количество образцов для класса.
+                                 Классы с меньшим количеством будут отфильтрованы.
+
+    Returns:
+        list of dict: Список словарей, где каждый словарь содержит
+                      'id', 'service', 'combined_text' (предобработанный),
+                      'attachments'.
+    """
+    tree = ET.parse(xml_file_path)
+    root = tree.getroot()
+
+    records = []
+    for record in root.findall('record'):
+        rec_id = record.find('id').text
+        service = record.find('service').text
+        topic_elem = record.find('topic')
+        topic = topic_elem.text if topic_elem is not None and topic_elem.text is not None else ""
+        # Используем .text для CDATA тоже
+        description_elem = record.find('description')
+        description = description_elem.text if description_elem is not None and description_elem.text is not None else ""
+        # attachments могут быть None или пустыми
+        attachments_elem = record.find('attachments')
+        attachments = attachments_elem.text if attachments_elem is not None and attachments_elem.text is not None else ""
+
+        # Объединяем topic и description
+        combined_text = f"{topic} {description}".strip()
+
+        records.append({
+            'id': rec_id,
+            'service': service,
+            'raw_text': combined_text, # Сохраняем до фильтрации классов
+            'attachments': attachments
+        })
+
+    # 1. Фильтрация по количеству данных в классе
+    service_counts = Counter([r['service'] for r in records])
+    valid_services = {service for service, count in service_counts.items() if count >= min_class_samples}
+
+    filtered_records = [r for r in records if r['service'] in valid_services]
+
+    # 2. Предобработка текста
+    processed_records = []
+    for record in filtered_records:
+        processed_text = preprocess_text(record['raw_text'])
+        # Убираем пустые тексты после предобработки
+        if processed_text:
+             processed_records.append({
+                 'id': record['id'],
+                 'service': record['service'],
+                 'combined_text': processed_text,
+                 'attachments': record['attachments']
+             })
+
+    return processed_records
+
+def preprocess_text(text):
+    """
+    Применяет цепочку предобработки к строке текста.
+    """
+    if not text:
+        return ""
+
+    # Приводим к Unicode NFD (декомпозиция), затем отфильтровываем диакритические знаки
+    # Это может помочь при работе с редкими символами, но основной фильтр - регулярное выражение
+    # text = unicodedata.normalize('NFD', text)
+    # text = ''.join(ch for ch in text if unicodedata.category(ch) != 'Mn')
+
+    # Удаление HTML-сущностей (если они не были раскрыты парсером, хотя CDATA обычно не содержит сущностей напрямую)
+    # text = html.unescape(text) # Необходим import html, если потребуется
+
+    # Заменяем последовательности пробельных символов (включая \n, \t) на один пробел
+    text = re.sub(r'\s+', ' ', text)
+
+    # Удаляем все символы, кроме букв (кириллица, латиница), цифр и пробелов
+    # \p{L} и \p{N} - юникодные категории для букв и чисел, но re может не поддерживать их напрямую
+    # Альтернатива: использовать [а-яёА-ЯЁa-zA-Z0-9\s] и удалить всё, что не входит в этот набор
+    # text = re.sub(r'[^\p{L}\p{N}\s]', '', text, flags=re.UNICODE) # Не всегда работает в Python
+    # Явно указываем кириллицу, латиницу, цифры, пробелы (пробел уже обработан выше)
+    # Сначала оставляем только разрешенные символы
+    text = re.sub(r'[^а-яёА-ЯЁa-zA-Z0-9\s]', ' ', text)
+    # Затем снова нормализуем пробелы
+    text = re.sub(r'\s+', ' ', text)
+
+    # Пробуем разделить "слитные" слова, например, ТипПлатформы -> Тип Платформы
+    # Ищем заглавную букву, которая идет после строчной или цифры/заглавной буквы (но не начало строки)
+    # Этот паттерн может создать лишние пробелы, например, "HTTPСессия" -> "HTTP Сессия" (OK) или "ТекстHTML" -> "Текст HTML" (OK)
+    # Но "iPhone" -> "I Phone" (не OK), но для русского "ТипПлатформы" -> "Тип Платформы" (OK)
+    # Паттерн: (?<=\p{Ll}\p{Lu}) или (?<=\p{N}\p{Lu}) или (?<=\p{Lu}\p{Lu}(?!\p{Lu})) - сложнее для re
+    # Упрощаем: (?<=[а-яёa-z0-9])(?=[А-ЯЁA-Z]) - после строчной/цифры и перед заглавной
+    #          (?<=[А-ЯЁA-Z])(?=[А-ЯЁA-Z][а-яёa-z]) - перед заглавной, за которой следует строчная (для аббревиатур перед словом)
+    # Комбинируем паттерны
+    text = re.sub(r'(?<=[а-яёa-z0-9])(?=[А-ЯЁA-Z])|(?<=[А-ЯЁA-Z])(?=[А-ЯЁA-Z][а-яёa-z])', ' ', text)
+
+    # Убираем лишние пробелы в начале и конце строки снова после вставки пробелов
+    text = text.strip()
+
+    return text
+
+if __name__ == "__main__":
+    # Пример использования
+    XML_PATH = "path/to/your/dataset.xml" # Укажите путь к вашему XML файлу
+    MIN_SAMPLES = 10 # Пример минимального количества образцов
+
+    print("Loading and preprocessing data...")
+    processed_data = load_and_preprocess_xml(XML_PATH, min_class_samples=MIN_SAMPLES)
+
+    print(f"Loaded {len(processed_data)} records after filtering and preprocessing.")
+    if processed_data:
+        print("Sample processed record:")
+        print(processed_data[0])
+
+    # Далее можно сохранить processed_data в CSV или использовать напрямую
+    # import csv
+    # with open('processed_data.csv', 'w', newline='', encoding='utf-8') as csvfile:
+    #     fieldnames = ['id', 'service', 'combined_text', 'attachments']
+    #     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    #     writer.writeheader()
+    #     for item in processed_data:
+    #         writer.writerow(item)
