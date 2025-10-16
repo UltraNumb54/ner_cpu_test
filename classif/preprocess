@@ -1,22 +1,108 @@
+!pip install pymorphy2
+
 import xml.etree.ElementTree as ET_std
 import lxml.etree as ET_lxml
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 import unicodedata
 import numpy as np
 import matplotlib.pyplot as plt
-import pandas as pd # Для сохранения в CSV
+import pandas as pd
+import pymorphy2
+import warnings
 
-def load_and_preprocess_xml(xml_file_path, min_class_samples=5, min_words_per_text=3):
+# Подавляем предупреждения от pymorphy2
+warnings.filterwarnings("ignore", category=UserWarning, module='pymorphy2')
+
+# Инициализация морфологического анализатора
+morph = pymorphy2.MorphAnalyzer()
+
+# Список стоп-слов (стандартные + кастомные)
+# Добавьте свои стоп-слова в этот список
+CUSTOM_STOPWORDS = [
+    "например", "также", "как", "этот", "свой", "ваш", "наш", "их",
+    "быть", "иметь", "сделать", "сказать", "такой", "мочь", "получить",
+    "помочь", "проблема", "ситуация", "вопрос", "нужно", "можно",
+    "спасибо", "добрый", "день", "вечер", "утро", "здрасьте", "привет",
+    "пожалуйста", "извините", "сейчас", "тут", "там", "все", "всем",
+    "мне", "меня", "себя", "себе", "себя", "себе", "себя", "себе",
+    "себя", "себе", "себя", "себе", "себя", "себе", "себя", "себе",
+    "пожалуйста", "пожалуйста", "пожалуйста", "пожалуйста", "пожалуйста",
+    "проблема", "проблема", "проблема", "проблема", "проблема", "проблема",
+    "ошибка", "ошибка", "ошибка", "ошибка", "ошибка", "ошибка"
+]
+
+# Объединяем стандартные русские стоп-слова с кастомными
+try:
+    from nltk.corpus import stopwords
+    nltk_stopwords = stopwords.words('russian')
+    ALL_STOPWORDS = set(nltk_stopwords + CUSTOM_STOPWORDS)
+except:
+    ALL_STOPWORDS = set(CUSTOM_STOPWORDS)
+
+def preprocess_text(text):
+    """Улучшенная предобработка текста с лемматизацией и удалением ФИО"""
+    if not text:
+        return ""
+    
+    # 1. Удаление ФИО (различные форматы)
+    text = re.sub(r'([А-Я][а-я]+ ){2}[А-Я][а-я]+', '', text)  # Иван Иванович Петров
+    text = re.sub(r'[А-Я]\.[А-Я]\. [А-Я][а-я]+', '', text)   # И.И. Петров
+    text = re.sub(r'[А-Я][а-я]+ [А-Я]\.[А-Я]\.', '', text)    # Петров И.И.
+    text = re.sub(r'[А-Я][а-я]+ [А-Я][а-я]+', '', text)       # Иван Петров (если в начале)
+    
+    # 2. Удаляем всё, кроме кириллических букв и пробелов
+    text = re.sub(r'[^а-яёА-ЯЁ\s]', ' ', text)
+    
+    # 3. Приводим к нижнему регистру
+    text = text.lower()
+    
+    # 4. Нормализуем пробелы
+    text = re.sub(r'\s+', ' ', text)
+    
+    # 5. Разделяем "слитные" слова (только для кириллицы)
+    text = re.sub(r'(?<=[а-яё])(?=[А-ЯЁ])|(?<=[А-ЯЁ])(?=[А-ЯЁ][а-яё])', ' ', text)
+    
+    # 6. Еще раз нормализуем пробелы
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+    
+    if not text:
+        return ""
+    
+    # 7. Токенизация и лемматизация
+    words = text.split()
+    lemmatized_words = []
+    
+    for word in words:
+        if len(word) < 2:  # Пропускаем слишком короткие слова
+            continue
+            
+        parsed = morph.parse(word)[0]
+        lemma = parsed.normal_form
+        
+        # Пропускаем леммы, которые являются стоп-словами
+        if lemma in ALL_STOPWORDS:
+            continue
+            
+        lemmatized_words.append(lemma)
+    
+    # 8. Формируем итоговый текст
+    return ' '.join(lemmatized_words)
+
+def load_and_preprocess_xml(xml_file_path, min_class_samples=5, max_class_samples=10000, min_words_per_text=3):
     """
-    Загружает, фильтрует и предобрабатывает XML.
-    min_words_per_text: Минимальное количество слов в тексте для включения в датасет.
+    Загружает, фильтрует и предобрабатывает XML с лемматизацией и ограничением классов.
+    
+    Args:
+        max_class_samples: Максимальное количество записей на класс (0 = без ограничения)
     """
     records = []
     parser = ET_lxml.XMLParser(recover=True, encoding='utf-8')
     tree = ET_lxml.parse(xml_file_path, parser)
     root = tree.getroot()
 
+    # Сбор всех записей
     for record in root.iter('record'):
         rec_id_elem = record.find('id')
         service_elem = record.find('service')
@@ -38,15 +124,32 @@ def load_and_preprocess_xml(xml_file_path, min_class_samples=5, min_words_per_te
             'attachments': attachments
         })
 
+    # Фильтрация по минимальному количеству записей на класс
     service_counts = Counter([r['service'] for r in records])
-    valid_services = {service for service, count in service_counts.items() if count >= min_class_samples}
+    valid_services = {service for service, count in service_counts.items() 
+                     if count >= min_class_samples}
+    
     filtered_records_by_class = [r for r in records if r['service'] in valid_services]
+    
+    # Ограничение максимального количества записей на класс
+    if max_class_samples > 0:
+        class_records = defaultdict(list)
+        for record in filtered_records_by_class:
+            class_records[record['service']].append(record)
+        
+        filtered_records_by_class = []
+        for service, recs in class_records.items():
+            if len(recs) > max_class_samples:
+                # Берем последние записи (предполагается, что порядок в XML - хронологический)
+                filtered_records_by_class.extend(recs[-max_class_samples:])
+            else:
+                filtered_records_by_class.extend(recs)
 
+    # Финальная обработка и фильтрация
     processed_records = []
     for record in filtered_records_by_class:
         processed_text = preprocess_text(record['raw_text'])
         if processed_text:
-            # Подсчет слов
             words = processed_text.split()
             if len(words) >= min_words_per_text:
                 processed_records.append({
@@ -55,35 +158,20 @@ def load_and_preprocess_xml(xml_file_path, min_class_samples=5, min_words_per_te
                     'combined_text': processed_text,
                     'attachments': record['attachments']
                 })
-            # else:
-            #     print(f"Текст с id {record['id']} отфильтрован по длине: '{processed_text}'")
 
     return processed_records
-
-def preprocess_text(text):
-    if not text:
-        return ""
-    # Удаляем всё, кроме кириллических букв и пробелов
-    text = re.sub(r'[^а-яёА-ЯЁ\s]', ' ', text)
-    # Нормализуем пробелы
-    text = re.sub(r'\s+', ' ', text)
-    # Пробуем разделить "слитные" слова (только для кириллицы)
-    text = re.sub(r'(?<=[а-яё])(?=[А-ЯЁ])|(?<=[А-ЯЁ])(?=[А-ЯЁ][а-яё])', ' ', text)
-    # Нормализуем пробелы после вставки
-    text = re.sub(r'\s+', ' ', text)
-    # Убираем лишние пробелы в начале и конце
-    text = text.strip()
-    return text
 
 if __name__ == "__main__":
     XML_PATH = "path/to/your/dataset.xml"
     MIN_SAMPLES_PER_CLASS = 10
-    MIN_WORDS_PER_TEXT = 3 # Устанавливаем порог для минимального количества слов
+    MAX_SAMPLES_PER_CLASS = 10000  # Ограничение на класс
+    MIN_WORDS_PER_TEXT = 3
 
     print("Загрузка и предобработка данных...")
     processed_data = load_and_preprocess_xml(
         XML_PATH,
         min_class_samples=MIN_SAMPLES_PER_CLASS,
+        max_class_samples=MAX_SAMPLES_PER_CLASS,
         min_words_per_text=MIN_WORDS_PER_TEXT
     )
 
@@ -123,25 +211,13 @@ if __name__ == "__main__":
         ax.set_xlabel('Класс (service)')
         ax.set_ylabel('Количество образцов')
         ax.set_xticks(range(len(services)))
-        ax.set_xticklabels(services, rotation=90, ha="right") # Подписи под столбцами
+        ax.set_xticklabels(services, rotation=90, ha="right")
         plt.tight_layout()
         plt.show()
 
-        # --- Гистограмма длин текстов ---
-        unique_lengths = set(text_lengths)
-        if len(unique_lengths) == 1:
-             print(f"Все тексты имеют одинаковую длину: {text_lengths[0]} символов. Гистограмма неинформативна.")
-        else:
-            num_bins = min(50, len(unique_lengths))
-            plt.figure(figsize=(10, 6))
-            plt.hist(text_lengths, bins=num_bins, edgecolor='black')
-            plt.title('Распределение длин текстов (combined_text)')
-            plt.xlabel('Длина текста (символы)')
-            plt.ylabel('Количество образцов')
-            plt.show()
-
         # --- Сохранение предобработанного датасета ---
-        OUTPUT_CSV_PATH = "processed_dataset.csv" # Укажите путь для сохранения
+        OUTPUT_CSV_PATH = "processed_dataset.csv"
         df_to_save = pd.DataFrame(processed_data)
         df_to_save.to_csv(OUTPUT_CSV_PATH, index=False, encoding='utf-8')
         print(f"\nПредобработанный датасет сохранен в файл: {OUTPUT_CSV_PATH}")
+        
