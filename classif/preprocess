@@ -5,8 +5,13 @@ from collections import Counter
 import unicodedata
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd # Для сохранения в CSV
 
-def load_and_preprocess_xml(xml_file_path, min_class_samples=5):
+def load_and_preprocess_xml(xml_file_path, min_class_samples=5, min_words_per_text=3):
+    """
+    Загружает, фильтрует и предобрабатывает XML.
+    min_words_per_text: Минимальное количество слов в тексте для включения в датасет.
+    """
     records = []
     parser = ET_lxml.XMLParser(recover=True, encoding='utf-8')
     tree = ET_lxml.parse(xml_file_path, parser)
@@ -35,18 +40,23 @@ def load_and_preprocess_xml(xml_file_path, min_class_samples=5):
 
     service_counts = Counter([r['service'] for r in records])
     valid_services = {service for service, count in service_counts.items() if count >= min_class_samples}
-    filtered_records = [r for r in records if r['service'] in valid_services]
+    filtered_records_by_class = [r for r in records if r['service'] in valid_services]
 
     processed_records = []
-    for record in filtered_records:
+    for record in filtered_records_by_class:
         processed_text = preprocess_text(record['raw_text'])
         if processed_text:
-            processed_records.append({
-                'id': record['id'],
-                'service': record['service'],
-                'combined_text': processed_text,
-                'attachments': record['attachments']
-            })
+            # Подсчет слов
+            words = processed_text.split()
+            if len(words) >= min_words_per_text:
+                processed_records.append({
+                    'id': record['id'],
+                    'service': record['service'],
+                    'combined_text': processed_text,
+                    'attachments': record['attachments']
+                })
+            # else:
+            #     print(f"Текст с id {record['id']} отфильтрован по длине: '{processed_text}'")
 
     return processed_records
 
@@ -67,13 +77,18 @@ def preprocess_text(text):
 
 if __name__ == "__main__":
     XML_PATH = "path/to/your/dataset.xml"
-    MIN_SAMPLES = 10
+    MIN_SAMPLES_PER_CLASS = 10
+    MIN_WORDS_PER_TEXT = 3 # Устанавливаем порог для минимального количества слов
 
     print("Загрузка и предобработка данных...")
-    processed_data = load_and_preprocess_xml(XML_PATH, min_class_samples=MIN_SAMPLES)
+    processed_data = load_and_preprocess_xml(
+        XML_PATH,
+        min_class_samples=MIN_SAMPLES_PER_CLASS,
+        min_words_per_text=MIN_WORDS_PER_TEXT
+    )
 
     print(f"Загружено {len(processed_data)} записей после фильтрации и предобработки.")
-    if processed_
+    if processed_data:
         print("Пример предобработанной записи:")
         print(processed_data[0])
 
@@ -94,6 +109,11 @@ if __name__ == "__main__":
         print(f"Максимальная длина текста: {max(text_lengths)}")
         print(f"Средняя длина текста: {np.mean(text_lengths):.2f}")
 
+        word_counts = [len(r['combined_text'].split()) for r in processed_data]
+        print(f"Минимальное количество слов в тексте: {min(word_counts)}")
+        print(f"Максимальное количество слов в тексте: {max(word_counts)}")
+        print(f"Среднее количество слов в тексте: {np.mean(word_counts):.2f}")
+
         # --- Визуализация ---
         fig, ax = plt.subplots(figsize=(14, 8))
         services = list(service_counts_after_filter.keys())
@@ -108,12 +128,10 @@ if __name__ == "__main__":
         plt.show()
 
         # --- Гистограмма длин текстов ---
-        # Проверим, есть ли разнообразие в длинах
         unique_lengths = set(text_lengths)
         if len(unique_lengths) == 1:
              print(f"Все тексты имеют одинаковую длину: {text_lengths[0]} символов. Гистограмма неинформативна.")
         else:
-            # Определим количество бинов разумно
             num_bins = min(50, len(unique_lengths))
             plt.figure(figsize=(10, 6))
             plt.hist(text_lengths, bins=num_bins, edgecolor='black')
@@ -121,3 +139,9 @@ if __name__ == "__main__":
             plt.xlabel('Длина текста (символы)')
             plt.ylabel('Количество образцов')
             plt.show()
+
+        # --- Сохранение предобработанного датасета ---
+        OUTPUT_CSV_PATH = "processed_dataset.csv" # Укажите путь для сохранения
+        df_to_save = pd.DataFrame(processed_data)
+        df_to_save.to_csv(OUTPUT_CSV_PATH, index=False, encoding='utf-8')
+        print(f"\nПредобработанный датасет сохранен в файл: {OUTPUT_CSV_PATH}")
