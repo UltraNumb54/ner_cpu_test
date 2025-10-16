@@ -1,0 +1,128 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+
+CSV_PATH = "processed_dataset.csv"
+df = pd.read_csv(CSV_PATH, encoding='utf-8')
+
+print(f"Датасет загружен. Количество записей: {len(df)}")
+print(f"Количество уникальных классов (service): {df['service'].nunique()}")
+
+X = df['combined_text']
+y = df['service']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print(f"Размер обучающей выборки: {len(X_train)}")
+print(f"Размер тестовой выборки: {len(X_test)}")
+
+tfidf = TfidfVectorizer(
+    max_features=10000,
+    ngram_range=(1, 2),
+)
+
+X_train_tfidf = tfidf.fit_transform(X_train)
+X_test_tfidf = tfidf.transform(X_test)
+
+print(f"Размерность TF-IDF матрицы (обучающая): {X_train_tfidf.shape}")
+print(f"Размерность TF-IDF матрицы (тестовая): {X_test_tfidf.shape}")
+
+param_grid = {
+    'C': [0.1, 1, 10],
+    'penalty': ['l1', 'l2'],
+    'solver': ['saga'] # Используем 'saga', так как он поддерживает l1 и l2 для мультикласса
+}
+
+base_model = LogisticRegression(random_state=42, class_weight='balanced', max_iter=1000)
+
+grid_search = GridSearchCV(
+    estimator=base_model,
+    param_grid=param_grid,
+    cv=3,
+    scoring='f1_macro',
+    n_jobs=-1,
+    verbose=1
+)
+
+print("Начинается подбор гиперпараметров...")
+grid_search.fit(X_train_tfidf, y_train)
+
+print("Лучшие параметры:", grid_search.best_params_)
+print("Лучшая оценка (f1_macro):", grid_search.best_score_)
+
+best_model = grid_search.best_estimator_
+
+y_pred = best_model.predict(X_test_tfidf)
+
+accuracy = accuracy_score(y_test, y_pred)
+print(f"\n--- Результаты модели ---")
+print(f"Точность (Accuracy) на тесте: {accuracy:.4f}")
+
+print("\nОтчет классификации (Test Set):")
+print(classification_report(y_test, y_pred))
+
+cm = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(12, 10))
+num_classes_to_show = min(10, len(best_model.classes_))
+if num_classes_to_show < len(best_model.classes_):
+    print(f"Матрица ошибок отображена для {num_classes_to_show} случайных классов из {len(best_model.classes_)}.")
+
+    np.random.seed(42)
+    selected_classes = np.random.choice(best_model.classes_, size=num_classes_to_show, replace=False)
+    original_classes = best_model.classes_
+    indices_to_show = [list(original_classes).index(c) for c in selected_classes]
+
+    cm_subset = cm[np.ix_(indices_to_show, indices_to_show)]
+    labels_subset = selected_classes
+
+    sns.heatmap(cm_subset, annot=True, fmt='d', cmap='Blues',
+                xticklabels=labels_subset, yticklabels=labels_subset)
+    plt.title(f'Матрица ошибок (Тест, подмножество из {num_classes_to_show} классов)')
+    plt.xlabel('Предсказанная метка')
+    plt.ylabel('Истинная метка')
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.show()
+else:
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=best_model.classes_, yticklabels=best_model.classes_)
+    plt.title('Матрица ошибок (Тест)')
+    plt.xlabel('Предсказанная метка')
+    plt.ylabel('Истинная метка')
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.show()
+
+feature_names = np.array(tfidf.get_feature_names_out())
+
+print("\n--- Топ-5 важных слов для каждого класса ---")
+if best_model.coef_.shape[0] == 1:
+    top_indices = np.argsort(best_model.coef_[0])[::-1]
+    top_features = feature_names[top_indices][:5]
+    print(f"Класс '{best_model.classes_[1]}': {top_features}")
+else:
+    for idx, class_label in enumerate(best_model.classes_):
+        class_coef = best_model.coef_[idx]
+        top_indices = np.argsort(class_coef)[::-1][:5]
+        top_features = feature_names[top_indices]
+        print(f"Класс '{class_label}': {top_features}")
+
+print("\n--- Обучение и анализ TF-IDF + LogisticRegression завершены ---")
+
+MODEL_PATH = "logreg_tfidf_model.pkl"
+TFIDF_PATH = "tfidf_vectorizer.pkl"
+
+joblib.dump(best_model, MODEL_PATH)
+joblib.dump(tfidf, TFIDF_PATH)
+print(f"\nЛучшая модель сохранена в: {MODEL_PATH}")
+print(f"Векторайзер TF-IDF сохранен в: {TFIDF_PATH}")
