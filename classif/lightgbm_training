@@ -1,0 +1,171 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+from lightgbm import LGBMClassifier  # Импорт LGBM
+
+# --- Информация о запуске ---
+print("--- Обучение модели TF-IDF + LightGBM ---")
+print("Цель: Классификация русскоязычных текстов техподдержки по сервисам.")
+print("Метод: TF-IDF векторизация + LightGBM с подбором гиперпараметров.")
+print("Обработка дисбаланса: Использование class_weight='balanced'.")
+print("-------------------------------------------------------------------")
+
+# --- Загрузка данных ---
+CSV_PATH = "processed_dataset_lemmatized_filtered.csv"  # Укажите путь к вашему файлу
+df = pd.read_csv(CSV_PATH, encoding='utf-8')
+
+print(f"Датасет загружен. Количество записей: {len(df)}")
+print(f"Количество уникальных классов (service): {df['service'].nunique()}")
+
+# --- Ограничение размера датасета (опционально, для ускорения) ---
+MAX_ROWS = 10000
+if len(df) > MAX_ROWS:
+    print(f"Датасет превышает {MAX_ROWS} записей. Выполняется сэмплирование...")
+    # Сэмплируем с восстановлением, чтобы сохранить распределение классов (stratify не работает с sample)
+    # Просто случайный выбор
+    df = df.sample(n=MAX_ROWS, random_state=42).reset_index(drop=True)
+    print(f"Датасет ограничен до {len(df)} случайных записей.")
+
+print(f"Размер датасета после ограничения: {len(df)}")
+
+# --- Разделение признаков и целевой переменной ---
+X = df['combined_text']
+y = df['service']
+
+# --- Разделение на обучающую и тестовую выборки ---
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print(f"Размер обучающей выборки: {len(X_train)}")
+print(f"Размер тестовой выборки: {len(X_test)}")
+
+# --- Векторизация TF-IDF ---
+print("\n--- Этап 1: Векторизация TF-IDF ---")
+# Уменьшаем max_features для ускорения и лучшей сходимости
+tfidf = TfidfVectorizer(
+    max_features=10000,  # Уменьшено
+    ngram_range=(1, 2),  # Униграммы и биграммы
+    # stop_words='russian' # Опционально: использовать стоп-слова
+)
+print(f"Параметры векторайзера: max_features={tfidf.max_features}, ngram_range={tfidf.ngram_range}")
+
+print("Обучение векторайзера и преобразование обучающих данных...")
+X_train_tfidf = tfidf.fit_transform(X_train)
+print("Преобразование тестовых данных...")
+X_test_tfidf = tfidf.transform(X_test)
+
+print(f"Размерность TF-IDF матрицы (обучающая): {X_train_tfidf.shape}")
+print(f"Размерность TF-IDF матрицы (тестовая): {X_test_tfidf.shape}")
+
+# --- Подбор гиперпараметров и обучение модели LightGBM ---
+print("\n--- Этап 2: Подбор гиперпараметров (GridSearchCV) ---")
+
+# Параметры для подбора
+param_grid = {
+    'n_estimators': [100, 200],          # Количество деревьев
+    'learning_rate': [0.1, 0.05],       # Скорость обучения
+    'max_depth': [6, 10],               # Максимальная глубина дерева
+    'class_weight': ['balanced']        # Обработка дисбаланса
+}
+
+print(f"Сетка параметров: {param_grid}")
+num_combinations = len(param_grid['n_estimators']) * len(param_grid['learning_rate']) * len(param_grid['max_depth'])
+print(f"Количество комбинаций параметров: {num_combinations}")
+
+# Создание базовой модели LGBM
+base_model = LGBMClassifier(
+    random_state=42,
+    verbosity=-1  # Отключить вывод обучения (уровень -1)
+)
+
+grid_search = GridSearchCV(
+    estimator=base_model,
+    param_grid=param_grid,
+    cv=3,                                # 3-фолдная кросс-валидация
+    scoring='f1_weighted',               # Метрика оценки (учитывает дисбаланс)
+    n_jobs=-1,                          # Использовать все ядра
+    verbose=1                           # Печатать прогресс для каждой подгонки
+)
+
+print("Запуск GridSearchCV. Это может занять некоторое время...")
+print("Формат вывода verbose=1 (показывает каждую подгонку):")
+grid_search.fit(X_train_tfidf, y_train)
+
+print("\n--- Результаты подбора гиперпараметров ---")
+print("Лучшие параметры:", grid_search.best_params_)
+print("Лучшая оценка (f1_weighted на CV):", grid_search.best_score_)
+
+best_model = grid_search.best_estimator_
+print(f"Обученная лучшая модель: {best_model}")
+
+# --- Предсказание на тестовой выборке ---
+print("\n--- Этап 3: Предсказание и оценка на тестовой выборке ---")
+print("Выполнение предсказаний на тестовой выборке...")
+y_pred = best_model.predict(X_test_tfidf)
+
+# --- Оценка модели ---
+accuracy = accuracy_score(y_test, y_pred)
+f1_macro = f1_score(y_test, y_pred, average='macro')
+f1_weighted = f1_score(y_test, y_pred, average='weighted')
+
+print(f"\n--- Результаты модели ---")
+print(f"Точность (Accuracy) на тесте: {accuracy:.4f}")
+print(f"F1 (macro) на тесте: {f1_macro:.4f}")
+print(f"F1 (weighted) на тесте: {f1_weighted:.4f}")
+
+print("\nОтчет классификации (Test Set):")
+print(classification_report(y_test, y_pred))
+
+# --- Визуализация: Матрица ошибок ---
+print("\n--- Визуализация: Матрица ошибок ---")
+cm = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(12, 10))
+num_classes_to_show = min(10, len(best_model.classes_))
+if num_classes_to_show < len(best_model.classes_):
+    print(f"Матрица ошибок отображена для {num_classes_to_show} случайных классов из {len(best_model.classes_)}.")
+
+    np.random.seed(42)
+    selected_classes = np.random.choice(best_model.classes_, size=num_classes_to_show, replace=False)
+    original_classes = best_model.classes_
+    indices_to_show = [list(original_classes).index(c) for c in selected_classes]
+
+    cm_subset = cm[np.ix_(indices_to_show, indices_to_show)]
+    labels_subset = selected_classes
+
+    sns.heatmap(cm_subset, annot=True, fmt='d', cmap='Blues',
+                xticklabels=labels_subset, yticklabels=labels_subset)
+    plt.title(f'Матрица ошибок (Тест, подмножество из {num_classes_to_show} классов)')
+    plt.xlabel('Предсказанная метка')
+    plt.ylabel('Истинная метка')
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.show()
+else:
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=best_model.classes_, yticklabels=best_model.classes_)
+    plt.title('Матрица ошибок (Тест)')
+    plt.xlabel('Предсказанная метка')
+    plt.ylabel('Истинная метка')
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.show()
+
+print("\n--- Обучение и анализ TF-IDF + LightGBM завершены ---")
+
+# --- Сохранение модели и векторайзера ---
+MODEL_PATH = "lgbm_tfidf_model_10k.pkl"
+TFIDF_PATH = "tfidf_vectorizer_10k.pkl"
+
+print(f"Сохранение модели и векторайзера...")
+joblib.dump(best_model, MODEL_PATH)
+joblib.dump(tfidf, TFIDF_PATH)
+print(f"\nЛучшая модель LightGBM сохранена в: {MODEL_PATH}")
+print(f"Векторайзер TF-IDF сохранен в: {TFIDF_PATH}")
