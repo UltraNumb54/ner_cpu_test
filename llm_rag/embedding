@@ -1,0 +1,494 @@
+!pip install sentence-transformers chromadb python-docx pypdf2 psycopg2-binary pandas
+pip install psycopg2-binary pandas
+
+import os
+import re
+import hashlib
+import logging
+from typing import List, Dict, Any, Optional, Union
+from sentence_transformers import SentenceTransformer
+from docx import Document
+import PyPDF2
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+EMBEDDING_MODEL_NAME = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
+CHROMA_DB_PATH = "./chroma_db"
+COLLECTION_NAME = "knowledge_base"
+
+embedding_model = None
+chroma_client = None
+collection = None
+
+
+def initialize_resources():
+    """Инициализирует модель и ChromaDB, если они ещё не инициализированы"""
+    global embedding_model, chroma_client, collection
+
+    # Проверка и инициализация модели
+    if embedding_model is None:
+        logger.info(f"Загрузка модели эмбеддинга: {EMBEDDING_MODEL_NAME}")
+        try:
+            embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            logger.info(f"Модель эмбеддинга была успешно загружена")
+        except Exception as e:
+            logger.error(f"Модель не была загружена: {e}")
+            raise
+
+    # Проверка и инициализация ChromaDB клиента
+    if chroma_client is None:
+        logger.info(f"Инициализация ChromaDB: {CHROMA_DB_PATH}")
+        try:
+            import chromadb
+            chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+            logger.info("ChromaDB была успешно инициализирована.")
+        except Exception as e:
+            logger.error(f"Ошибка инициализации ChromaDB: {e}")
+            raise
+
+    # Проверка и инициализация коллекции
+    if collection is None:
+        logger.info(f"Получение или создание коллекции: {COLLECTION_NAME}")
+        try:
+            collection = chroma_client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={"description": "База знаний технической поддержки"}
+            )
+            logger.info("Коллекция готова.")
+        except Exception as e:
+            logger.error(f"Ошибка в получении/создании коллекции: {e}")
+            raise
+
+
+def preprocess_text(text: str) -> str:
+    """Преобразует текст: очистка, приведение к нижнему регистру."""
+    if not text:
+        return ""
+
+    text = text.lower()
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\w\sа-яё.,!?;:()\-]', ' ', text)
+    text = ' '.join(text.split())
+
+    return text.strip()
+
+
+def read_txt_file(file_path: str) -> str:
+    """Чтение TXT файла с обработкой кодировок."""
+    encodings = ['utf-8', 'cp1251']
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as file:
+                return file.read()
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeDecodeError(f"Could not decode file {file_path} with encodings {encodings}")
+
+
+def read_docx_file(file_path: str) -> str:
+    """Чтение DOCX файла."""
+    doc = Document(file_path)
+    text = []
+    for paragraph in doc.paragraphs:
+        if paragraph.text.strip():
+            text.append(paragraph.text)
+    return '\n'.join(text)
+
+
+def read_pdf_file(file_path: str) -> str:
+    """Чтение PDF файла."""
+    text = ""
+    try:
+        with open(file_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                extracted = page.extract_text()
+                if extracted:
+                    text += extracted + "\n"
+    except Exception as e:
+        logger.error(f"Error reading PDF {file_path}: {e}")
+        raise
+    return text
+
+
+def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> List[str]:
+    """Разбивка текста на перекрывающиеся чанки."""
+    if not text:
+        return []
+
+    words = text.split()
+    if len(words) <= chunk_size:
+        return [text]
+
+    chunks = []
+    start_idx = 0
+    while start_idx < len(words):
+        end_idx = start_idx + chunk_size
+        chunk = ' '.join(words[start_idx:end_idx])
+        chunks.append(chunk)
+
+        if end_idx >= len(words):
+            break
+
+        start_idx = end_idx - chunk_overlap
+
+    return chunks
+
+
+def add_document_to_db(document_text: str, source_metadata: Dict[str, Any], preprocessor=preprocess_text):
+    """Добавляет предварительно обработанный документ (или чанки) в базу ChromaDB."""
+    global collection, embedding_model
+
+    # 1. Предобработка всего текста
+    processed_text = preprocessor(document_text)
+
+    if not processed_text:
+        logger.warning("Document text is empty after preprocessing, skipping.")
+        return 0
+
+    # 2. Разбиение на чанки
+    chunks = chunk_text(processed_text)
+
+    if not chunks:
+        logger.warning(f"No chunks created from document with metadata {source_metadata}, skipping.")
+        return 0
+
+    # 3. Создание эмбеддингов и добавление в базу
+    embeddings = embedding_model.encode(chunks).tolist()
+    ids = []
+    metadatas = []
+    documents = []
+
+    for i, chunk in enumerate(chunks):
+        # Создаем уникальный ID для чанка
+        chunk_hash = hashlib.md5(chunk.encode()).hexdigest()[:8]
+        chunk_id = f"{source_metadata.get('source_id', 'unknown')}_chunk_{i}_{chunk_hash}"
+
+        ids.append(chunk_id)
+        metadatas.append({**source_metadata, "chunk_index": i, "total_chunks_in_doc": len(chunks)})
+        documents.append(chunk)
+
+    try:
+        collection.add(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
+        logger.info(f"Added {len(chunks)} chunks from source {source_metadata.get('source_id')} to ChromaDB.")
+        return len(chunks)
+    except Exception as e:
+        logger.error(f"Error adding chunks to ChromaDB: {e}")
+        raise
+
+
+def process_documents_folder(folder_path: str) -> Dict[str, Any]:
+    """Обработка всех документов в папке и добавление в базу."""
+    initialize_resources() # Убедиться, что ресурсы инициализированы
+
+    supported_extensions = {'.txt', '.docx', '.pdf'}
+    processed_files = []
+    total_chunks_added = 0
+
+    logger.info(f"Starting to process documents in folder: {folder_path}")
+
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+        file_ext = os.path.splitext(filename)[1].lower()
+
+        if file_ext not in supported_extensions:
+            logger.debug(f"Skipping unsupported file: {filename}")
+            continue
+
+        logger.info(f"Processing file: {filename}")
+
+        try:
+            # Чтение файла в зависимости от формата
+            if file_ext == '.txt':
+                text = read_txt_file(file_path)
+            elif file_ext == '.docx':
+                text = read_docx_file(file_path)
+            elif file_ext == '.pdf':
+                text = read_pdf_file(file_path)
+            else:
+                logger.warning(f"Unsupported file extension: {file_ext} for {filename}")
+                continue
+
+            # Подготовка метаданных для этого документа
+            source_metadata = {
+                "source_id": filename,
+                "file_type": file_ext,
+                "original_path": file_path
+            }
+
+            # Добавление документа в базу
+            chunks_added = add_document_to_db(text, source_metadata)
+            total_chunks_added += chunks_added
+
+            if chunks_added > 0:
+                 processed_files.append(filename)
+                 logger.info(f"Successfully processed {filename}, added {chunks_added} chunks.")
+
+        except Exception as e:
+            logger.error(f"Error processing file {filename}: {e}")
+
+    return {
+        "processed_files": processed_files,
+        "total_chunks_added": total_chunks_added,
+        "total_files_processed": len(processed_files)
+    }
+
+
+def search_similar_documents(query: str, n_results: int = 3, preprocessor=preprocess_text) -> Dict[str, Any]:
+    """Поиск похожих документов по запросу."""
+    initialize_resources() # Убедиться, что ресурсы инициализированы
+
+    if not query:
+        logger.warning("Query is empty.")
+        return {"query": query, "documents": [], "sources": [], "distances": []}
+
+    # 1. Предобработка запроса
+    processed_query = preprocessor(query)
+
+    # 2. Создание эмбеддинга для запроса
+    query_embedding = embedding_model.encode([processed_query]).tolist() # Обернули в список для encode
+
+    # 3. Ищем в базе
+    try:
+        results = collection.query(
+            query_embeddings=query_embedding,
+            n_results=n_results,
+            include=["documents", "metadatas", "distances"]
+        )
+    except Exception as e:
+        logger.error(f"Error querying ChromaDB: {e}")
+        return {"query": query, "documents": [], "sources": [], "distances": []}
+
+    return {
+        "query": query,
+        "documents": results['documents'][0] if results['documents'] else [],
+        "sources": results['metadatas'][0] if results['metadatas'] else [],
+        "distances": results['distances'][0] if results['distances'] else []
+    }
+
+
+def get_collection_stats() -> Dict[str, Any]:
+    """Получение статистики коллекции."""
+    initialize_resources() # Убедиться, что ресурсы инициализированы
+    try:
+        count = collection.count()
+        return {
+            "total_chunks": count,
+            "collection_name": collection.name
+        }
+    except Exception as e:
+        logger.error(f"Error getting collection stats: {e}")
+        return {"total_chunks": -1, "collection_name": COLLECTION_NAME}
+
+
+# --- Функции для работы с документами из БД ---
+
+def process_documents_from_db(fetch_documents_func, *fetch_args, **fetch_kwargs) -> Dict[str, Any]:
+    """
+    Обрабатывает документы, полученные из БД, и добавляет их в ChromaDB.
+    fetch_documents_func: Функция, которая возвращает список словарей {'id': ..., 'text': ...}
+    *fetch_args, **fetch_kwargs: Аргументы для fetch_documents_func
+    """
+    initialize_resources() # Убедиться, что ресурсы инициализированы
+
+    processed_docs = []
+    total_chunks_added = 0
+
+    logger.info("Starting to process documents fetched from database.")
+
+    try:
+        # Предположим, fetch_documents_func возвращает список {'id': ..., 'text': ...}
+        documents_list = fetch_documents_func(*fetch_args, **fetch_kwargs)
+    except Exception as e:
+        logger.error(f"Error fetching documents from DB: {e}")
+        return {"processed_docs": [], "total_chunks_added": 0, "total_docs_processed": 0}
+
+    for doc_data in documents_list:
+        doc_id = doc_data.get('id')
+        doc_text = doc_data.get('text')
+
+        if not doc_id or not doc_text:
+             logger.warning(f"Skipping document with missing id or text: {doc_data}")
+             continue
+
+        logger.info(f"Processing document from DB: {doc_id}")
+
+        try:
+            # Подготовка метаданных для документа из БД
+            source_metadata = {
+                "source_id": str(doc_id), # Используем ID из БД
+                "source_type": "database",
+                "db_table": fetch_kwargs.get('table_name', 'unknown') # Пример передачи названия таблицы
+            }
+
+            # Добавление документа в базу
+            chunks_added = add_document_to_db(doc_text, source_metadata)
+            total_chunks_added += chunks_added
+
+            if chunks_added > 0:
+                 processed_docs.append(str(doc_id))
+                 logger.info(f"Successfully processed DB doc {doc_id}, added {chunks_added} chunks.")
+
+        except Exception as e:
+            logger.error(f"Error processing DB document {doc_id}: {e}")
+
+    return {
+        "processed_docs": processed_docs,
+        "total_chunks_added": total_chunks_added,
+        "total_docs_processed": len(processed_docs)
+    }
+
+
+def fetch_docs_from_postgres_example(connection_params: Dict[str, Any], table_name: str, text_column: str, id_column: str) -> List[Dict[str, Any]]:
+    """
+    Пример функции для извлечения документов из PostgreSQL.
+    Возвращает список словарей {'id': ..., 'text': ...}
+    """
+    import psycopg2
+    import pandas as pd
+
+    conn = None
+    try:
+        conn = psycopg2.connect(**connection_params)
+        query = f"SELECT {id_column}, {text_column} FROM {table_name};" # Убедитесь, что столбцы существуют
+        df = pd.read_sql_query(query, conn)
+        # Преобразуем DataFrame в список словарей
+        docs_list = df.to_dict(orient='records')
+        logger.info(f"Fetched {len(docs_list)} documents from table '{table_name}' in PostgreSQL.")
+        return docs_list
+    except Exception as e:
+        logger.error(f"Error fetching from PostgreSQL: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+# --- Запуск основного процесса ---
+def main():
+    # Создаем папку для документов, если её нет
+    documents_folder = "documents"
+    os.makedirs(documents_folder, exist_ok=True)
+
+    print("=" * 60)
+    print("RUNNING DOCUMENT PROCESSING")
+    print("=" * 60)
+
+    # 1. Обработка документов из папки
+    result_folder = process_documents_folder(documents_folder)
+
+    print("\n" + "=" * 60)
+    print("PROCESSING RESULTS FROM FOLDER")
+    print("=" * 60)
+    print(f"Files processed from folder: {result_folder['total_files_processed']}")
+    print(f"Chunks added from folder: {result_folder['total_chunks_added']}")
+    print(f"Processed files: {', '.join(result_folder['processed_files'])}")
+
+    # 2. Пример: Обработка документов из БД (закомментировано, чтобы не запускалось без конфигурации)
+    # connection_params_example = {
+    #     'host': 'localhost',
+    #     'database': 'your_db_name',
+    #     'user': 'your_user',
+    #     'password': 'your_password'
+    # }
+    # table_name_example = 'your_table'
+    # id_column_example = 'id'
+    # text_column_example = 'content'
+    # result_db = process_documents_from_db(
+    #     fetch_docs_from_postgres_example,
+    #     connection_params_example,
+    #     table_name_example,
+    #     text_column_example,
+    #     id_column_example,
+    #     table_name=table_name_example # Передаем название таблицы как метаданные
+    # )
+    # print("\n" + "=" * 60)
+    # print("PROCESSING RESULTS FROM DATABASE")
+    # print("=" * 60)
+    # print(f"Docs processed from DB: {result_db['total_docs_processed']}")
+    # print(f"Chunks added from DB: {result_db['total_chunks_added']}")
+    # print(f"Processed docs IDs: {', '.join(result_db['processed_docs'])}")
+
+
+    # Статистика базы данных
+    stats = get_collection_stats()
+    print(f"\nDATABASE STATS:")
+    print(f"Total chunks in DB: {stats['total_chunks']}")
+    print(f"Collection name: {stats['collection_name']}")
+
+    # TEST QUERIES
+    print("\n" + "=" * 60)
+    print("TESTING SEARCH")
+    print("=" * 60)
+
+    test_queries = [
+        "technical support",
+        "system setup",
+        "user manual",
+        "connection issues"
+    ]
+
+    for query in test_queries:
+        print(f"\nQuery: '{query}'")
+        print("-" * 40)
+
+        results = search_similar_documents(query, n_results=2)
+
+        if results['documents']:
+            for i, (doc, source, distance) in enumerate(zip(
+                results['documents'],
+                results['sources'],
+                results['distances']
+            )):
+                print(f"{i+1}. File: {source.get('source_id', 'unknown')} (chunk {source.get('chunk_index', -1) + 1})")
+                print(f"   Distance: {distance:.4f}")
+                print(f"   Text: {doc[:150]}...") # Выводим первые 150 символов
+                print()
+        else:
+            print("No results found for this query.")
+
+    print("=" * 60)
+    print("PROCESSING COMPLETED!")
+    print("=" * 60)
+
+
+# Дополнительные утилиты для работы с базой
+def test_specific_queries():
+    """Функция для тестирования конкретных запросов"""
+    # Ресурсы инициализируются внутри search_similar_documents
+
+    # Ваши специфические запросы
+    custom_queries = [
+        "How to set up two-factor authentication?",
+        "Password requirements",
+        "Access recovery procedure",
+        "Technical support contacts"
+    ]
+
+    print("\nTESTING SPECIFIC QUERIES")
+    print("=" * 50)
+
+    for query in custom_queries:
+        print(f"\nQuery: '{query}'")
+        print("-" * 40)
+
+        results = search_similar_documents(query, n_results=3)
+
+        if results['documents']:
+            for i, (doc, source, distance) in enumerate(zip(
+                results['documents'],
+                results['sources'],
+                results['distances']
+            )):
+                print(f"{i+1}. Source: {source.get('source_id', 'unknown')} (distance: {distance:.4f})")
+                print(f"   Text: {doc[:200]}...") # Выводим первые 200 символов
+        else:
+            print("No results found for this query")
+
+# Запуск основной функции
+if __name__ == "__main__":
+    main()
+
+    # Дополнительное тестирование
+    test_specific_queries()
