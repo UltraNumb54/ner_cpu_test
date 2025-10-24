@@ -1,0 +1,114 @@
+import chromadb
+from sentence_transformers import SentenceTransformer
+from openai import OpenAI
+import os
+from unstructured.partition.auto import partition
+import hashlib
+
+# Инициализация модели эмбеддингов
+embedding_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+
+# Инициализация ChromaDB
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection(
+    name="knowledge_base",
+    metadata={"hnsw:space": "cosine"}
+)
+
+# Инициализация клиента для LM Studio
+lm_client = OpenAI(
+    base_url=f"http://192.168.1.100:1234/v1",  # Ваш IP Windows
+    api_key="lm-studio"  # LM Studio принимает любой ключ
+)
+
+def process_documents(documents_folder):
+    """Загружает и обрабатывает документы в векторную БД"""
+    
+    processed_files = []
+    
+    for filename in os.listdir(documents_folder):
+        if filename.endswith(('.pdf', '.docx', '.txt')):
+            file_path = os.path.join(documents_folder, filename)
+            print(f"Обрабатываю: {filename}")
+            
+            # Парсинг документа
+            elements = partition(file_path)
+            
+            chunks = []
+            current_chunk = ""
+            
+            for element in elements:
+                text = str(element)
+                if len(current_chunk + text) < 1000:
+                    current_chunk += " " + text
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = text
+            
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            
+            # Создание эмбеддингов и сохранение в БД
+            for i, chunk in enumerate(chunks):
+                embedding = embedding_model.encode(chunk).tolist()
+                chunk_id = f"{filename}_{i}"
+                
+                collection.add(
+                    ids=[chunk_id],
+                    embeddings=[embedding],
+                    documents=[chunk],
+                    metadatas=[{"source": filename, "chunk": i}]
+                )
+            
+            processed_files.append(filename)
+    
+    return processed_files
+
+def ask_question(question, num_results=3):
+    """Ищет релевантную информацию и генерирует ответ"""
+    
+    # Создаем эмбеддинг для вопроса
+    question_embedding = embedding_model.encode(question).tolist()
+    
+    # Ищем релевантные чанки
+    results = collection.query(
+        query_embeddings=[question_embedding],
+        n_results=num_results
+    )
+    
+    # Формируем контекст
+    context = "\n\n".join(results['documents'][0])
+    
+    # Создаем промпт для модели
+    prompt = f"""Ты - ассистент технической поддержки. Ответь на вопрос пользователя на основе предоставленного контекста."""
+    
+    # Генерируем ответ через LM Studio
+    response = lm_client.chat.completions.create(
+        model="mistral",  # Должно совпадать с именем модели в LM Studio
+        messages=[
+            {"role": "system", "content": "Ты полезный ассистент технической поддержки. Отвечай точно на основе предоставленной информации."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1,
+        max_tokens=500
+    )
+    
+    return {
+        "answer": response.choices[0].message.content,
+        "sources": results['metadatas'][0]
+    }
+
+# Создайте папку для документов
+import os
+os.makedirs("documents", exist_ok=True)
+
+processed = process_documents("documents")
+print(f"Обработано файлов: {len(processed)}")
+
+# Протестируйте систему
+question = "Как настроить двухфакторную аутентификацию?"
+result = ask_question(question)
+print("Ответ:", result["answer"])
+print("Источники:", result["sources"])
+
